@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>iPad 电池负载测试</title>
+<style>
+  :root { font: 17px/1.55 system-ui, sans-serif; color: #eaf4ee; background: #101916; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
+  main { box-sizing: border-box; width: min(100%, 38rem); padding: 2rem 1.3rem; }
+  h1 { font-size: clamp(1.8rem, 6vw, 2.7rem); margin: 0 0 .5rem; }
+  p { margin: .5rem 0 1rem; color: #b7cbc0; }
+  .panel { padding: 1.25rem; background: #192620; border: 1px solid #3a5144; border-radius: 1rem; }
+  #status { display: block; font-weight: 700; color: #baf5cc; }
+  #clock { margin: .1rem 0 .45rem; font-size: 2.3rem; font-variant-numeric: tabular-nums; }
+  .controls { display: flex; flex-wrap: wrap; align-items: end; gap: .8rem; }
+  label { display: grid; gap: .3rem; }
+  button, select { box-sizing: border-box; min-height: 48px; padding: .45rem .8rem; border-radius: .5rem; font: inherit; }
+  select { background: #111b16; color: #eaf4ee; border: 1px solid #6b8677; }
+  button { border: 0; color: #12251a; background: #baf5cc; font-weight: 700; cursor: pointer; }
+  #gpu-view { display: block; width: 100%; height: 5rem; object-fit: cover; border-radius: .55rem; margin: .8rem 0; }
+  #gpu-view[hidden] { display: none; }
+  #screen { margin-top: .9rem; font-size: .9rem; }
+  footer { margin-top: 1rem; color: #b7cbc0; font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>iPad 电池负载测试</h1>
+  <p>页面在前台时自动运行。关闭标签页即可停止。</p>
+  <section class="panel" aria-label="测试控制">
+    <output id="status" role="status">正在准备</output>
+    <div id="clock" aria-label="剩余时间">--:--</div>
+    <p id="activity">等待运算开始</p>
+    <canvas id="gpu-view" width="768" height="384" hidden aria-hidden="true"></canvas>
+    <div class="controls">
+      <label>负载强度
+        <select id="preset">
+          <option value="light">低</option>
+          <option value="medium">中</option>
+          <option value="high">高</option>
+        </select>
+      </label>
+      <button type="button" id="toggle">停止</button>
+    </div>
+    <div id="screen"></div>
+  </section>
+  <footer>倒计时只计算前台运行时间。锁屏或切走会暂停，回到此页后继续。</footer>
+  <noscript>请启用 JavaScript 后重新打开。</noscript>
+</main>
+<script id="worker-source" type="text/plain">
+self.onmessage = ({ data }) => {
+  const { duty, seed } = data;
+  const periodMs = 100;
+  let value = seed;
+  let total = 0;
+  let reportAt = performance.now() + 1000;
+
+  function runSlice() {
+    const start = performance.now();
+    const end = start + periodMs * duty;
+    do {
+      for (let i = 0; i < 4096; i++) {
+        value ^= value << 13;
+        value ^= value >>> 17;
+        value ^= value << 5;
+      }
+      total += 4096;
+    } while (performance.now() < end);
+
+    const now = performance.now();
+    if (now >= reportAt) {
+      self.postMessage({ total, checksum: value });
+      reportAt = now + 1000;
+    }
+    setTimeout(runSlice, Math.max(0, periodMs - (now - start)));
+  }
+
+  runSlice();
+};
+</script>
+<script>
+(() => {
+  'use strict';
+
+  const presets = {
+    light: { count: 1, duty: 0.35 },
+    medium: { count: 2, duty: 0.65 },
+    high: { count: 8, duty: 0.9, graphics: true }
+  };
+  const params = new URLSearchParams(location.search);
+  const selectedPreset = params.get('preset');
+  const requestedMinutes = Number(params.get('minutes'));
+  const minutes = Number.isInteger(requestedMinutes) && requestedMinutes >= 1 &&
+    requestedMinutes <= 120 ? requestedMinutes : 60;
+  const sessionMs = minutes * 60_000;
+  const preset = document.getElementById('preset');
+  const status = document.getElementById('status');
+  const clock = document.getElementById('clock');
+  const activity = document.getElementById('activity');
+  const screen = document.getElementById('screen');
+  const canvas = document.getElementById('gpu-view');
+  const toggle = document.getElementById('toggle');
+
+  preset.value = Object.prototype.hasOwnProperty.call(presets, selectedPreset) ? selectedPreset : 'high';
+
+  let enabled = params.get('autostart') !== '0';
+  let remainingMs = sessionMs;
+  let startedAt = null;
+  let workers = [];
+  let workerUrl = null;
+  let graphics = null;
+  let graphicsFrame = null;
+  let totals = [];
+  let completedOps = 0;
+  let wakeLock = null;
+  let wakePending = false;
+  let wakeUnavailable = false;
+  let failure = false;
+
+  function secondsLeft() {
+    const activeMs = startedAt === null ? 0 : performance.now() - startedAt;
+    return Math.max(0, Math.ceil((remainingMs - activeMs) / 1000));
+  }
+
+  function render() {
+    const seconds = secondsLeft();
+    clock.textContent = String(Math.floor(seconds / 60)).padStart(2, '0') + ':' +
+      String(seconds % 60).padStart(2, '0');
+
+    if (startedAt !== null) {
+      const count = completedOps + totals.reduce((sum, value) => sum + value, 0);
+      const gpuStatus = presets[preset.value].graphics
+        ? (graphics ? ' + GPU 渲染' : ' · GPU 不可用')
+        : '';
+      const workerStatus = workers.length + ' 个 CPU 运算线程' + gpuStatus;
+      activity.textContent = count > 0
+        ? workerStatus + ' · 累计 ' + count.toLocaleString('zh-CN') + ' 次迭代'
+        : workerStatus + ' · 正在启动';
+    } else {
+      activity.textContent = '当前没有运行运算';
+    }
+
+    const state = failure ? '运算启动失败，请重新载入页面' :
+      startedAt !== null ? '运行中' :
+      remainingMs <= 0 ? '已到时' : enabled ? '切回页面后继续' : '已停止';
+    if (status.textContent !== state) status.textContent = state;
+    toggle.textContent = enabled ? '停止' : '开始';
+    toggle.disabled = failure;
+    screen.textContent = startedAt === null ? '' :
+      wakeLock && !wakeLock.released ? '已请求保持屏幕常亮' :
+      wakeUnavailable ? '无法保持屏幕常亮 · 锁屏后会暂停' : '正在请求保持屏幕常亮';
+  }
+
+  async function requestWakeLock() {
+    if (wakePending || wakeLock) return;
+    if (!navigator.wakeLock) {
+      wakeUnavailable = true;
+      return;
+    }
+    wakePending = true;
+    try {
+      const lock = await navigator.wakeLock.request('screen');
+      if (startedAt === null || document.hidden) {
+        await lock.release();
+      } else if (!lock.released) {
+        wakeLock = lock;
+        lock.addEventListener('release', () => {
+          if (wakeLock === lock) {
+            wakeLock = null;
+            wakeUnavailable = true;
+            render();
+          }
+        });
+      } else {
+        wakeUnavailable = true;
+      }
+    } catch {
+      wakeUnavailable = true;
+    } finally {
+      wakePending = false;
+      render();
+    }
+  }
+
+  function compileShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    if (!shader) return null;
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (gl.getShaderParameter(shader, gl.COMPILE_STATUS)) return shader;
+    gl.deleteShader(shader);
+    return null;
+  }
+
+  function startGraphics() {
+    const gl = canvas.getContext('webgl', {
+      alpha: false, antialias: false, depth: false, stencil: false,
+      powerPreference: 'high-performance'
+    });
+    if (!gl || gl.isContextLost()) return;
+
+    const vertex = compileShader(gl, gl.VERTEX_SHADER, `
+      attribute vec2 position;
+      void main() { gl_Position = vec4(position, 0.0, 1.0); }
+    `);
+    const fragment = compileShader(gl, gl.FRAGMENT_SHADER, `
+      #ifdef GL_FRAGMENT_PRECISION_HIGH
+      precision highp float;
+      #else
+      precision mediump float;
+      #endif
+      uniform vec2 resolution;
+      uniform float phase;
+      void main() {
+        vec2 p = (2.0 * gl_FragCoord.xy - resolution) / resolution.y;
+        float energy = 0.0;
+        for (int i = 0; i < 96; i++) {
+          float k = float(i) * 0.117 + phase;
+          p += 0.18 * vec2(sin(p.y * 2.1 + k), cos(p.x * 2.3 - k));
+          energy += sin(dot(p, p) + k) * cos(p.x - p.y);
+        }
+        vec3 color = vec3(0.10, 0.38, 0.25) +
+          0.15 * cos(energy * 0.17 + vec3(0.0, 1.1, 2.2));
+        gl_FragColor = vec4(color, 1.0);
+      }
+    `);
+    const program = vertex && fragment ? gl.createProgram() : null;
+    if (program) {
+      gl.attachShader(program, vertex);
+      gl.attachShader(program, fragment);
+      gl.linkProgram(program);
+    }
+    if (vertex) gl.deleteShader(vertex);
+    if (fragment) gl.deleteShader(fragment);
+    if (!program) return;
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      gl.deleteProgram(program);
+      return;
+    }
+
+    const buffer = gl.createBuffer();
+    if (!buffer) {
+      gl.deleteProgram(program);
+      return;
+    }
+    gl.useProgram(program);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const position = gl.getAttribLocation(program, 'position');
+    gl.enableVertexAttribArray(position);
+    gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.uniform2f(gl.getUniformLocation(program, 'resolution'), canvas.width, canvas.height);
+    const phase = gl.getUniformLocation(program, 'phase');
+
+    graphics = { gl, program, buffer };
+    canvas.hidden = false;
+    function draw(now) {
+      if (!graphics || document.hidden) return;
+      gl.uniform1f(phase, (now % 60_000) / 1000);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      graphicsFrame = requestAnimationFrame(draw);
+    }
+    graphicsFrame = requestAnimationFrame(draw);
+  }
+
+  function stopGraphics() {
+    if (graphicsFrame !== null) {
+      cancelAnimationFrame(graphicsFrame);
+      graphicsFrame = null;
+    }
+    if (graphics) {
+      const { gl, program, buffer } = graphics;
+      gl.useProgram(null);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      gl.deleteBuffer(buffer);
+      gl.deleteProgram(program);
+      graphics = null;
+    }
+    canvas.hidden = true;
+  }
+
+  function stopWorkers() {
+    stopGraphics();
+    if (startedAt !== null) {
+      remainingMs = Math.max(0, remainingMs - (performance.now() - startedAt));
+      startedAt = null;
+    }
+    completedOps += totals.reduce((sum, value) => sum + value, 0);
+    totals = [];
+    for (const worker of workers) worker.terminate();
+    workers = [];
+    if (workerUrl) {
+      URL.revokeObjectURL(workerUrl);
+      workerUrl = null;
+    }
+    if (wakeLock) {
+      const lock = wakeLock;
+      wakeLock = null;
+      lock.release().catch(() => {});
+    }
+  }
+
+  function fail() {
+    failure = true;
+    enabled = false;
+    stopWorkers();
+    render();
+  }
+
+  function startWorkers() {
+    if (!enabled || document.hidden || startedAt !== null || remainingMs <= 0) return;
+    const config = presets[preset.value];
+    const count = Math.min(config.count, navigator.hardwareConcurrency || config.count);
+    try {
+      const source = document.getElementById('worker-source').textContent;
+      workerUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+      totals = Array(count).fill(0);
+      for (let i = 0; i < count; i++) {
+        const worker = new Worker(workerUrl);
+        workers.push(worker);
+        worker.onmessage = ({ data }) => {
+          if (workers[i] === worker) totals[i] = data.total;
+        };
+        worker.onerror = () => {
+          if (workers[i] === worker) fail();
+        };
+        worker.postMessage({ duty: config.duty, seed: 104729 + i });
+      }
+      startedAt = performance.now();
+      if (config.graphics) {
+        try { startGraphics(); } catch { stopGraphics(); }
+      }
+      wakeUnavailable = false;
+      requestWakeLock();
+    } catch {
+      fail();
+    }
+  }
+
+  function refresh() {
+    if (secondsLeft() === 0 && enabled) {
+      enabled = false;
+      stopWorkers();
+      remainingMs = 0;
+    }
+    render();
+  }
+
+  toggle.addEventListener('click', () => {
+    enabled = !enabled;
+    if (enabled) {
+      if (remainingMs <= 0) remainingMs = sessionMs;
+      completedOps = 0;
+      startWorkers();
+    } else {
+      stopWorkers();
+    }
+    render();
+  });
+
+  preset.addEventListener('change', () => {
+    stopWorkers();
+    startWorkers();
+    render();
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) stopWorkers();
+    else startWorkers();
+    refresh();
+  });
+
+  canvas.addEventListener('webglcontextlost', event => {
+    event.preventDefault();
+    stopGraphics();
+    render();
+  });
+  canvas.addEventListener('webglcontextrestored', () => {
+    if (startedAt !== null && presets[preset.value].graphics) {
+      try { startGraphics(); } catch { stopGraphics(); }
+      render();
+    }
+  });
+
+  window.addEventListener('pagehide', stopWorkers);
+  window.addEventListener('pageshow', () => {
+    startWorkers();
+    refresh();
+  });
+
+  startWorkers();
+  refresh();
+  setInterval(refresh, 250);
+})();
+</script>
+</body>
+</html>
